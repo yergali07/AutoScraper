@@ -3,14 +3,14 @@ import json
 import time
 import threading
 import requests
+import traceback
+import re
 from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 load_dotenv()
 
@@ -123,8 +123,10 @@ def is_session_expired(driver):
     except:
         return False
 
+def safe_name(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", s)
 
-def run_for_user(user):
+def run_for_user(user, idx: int):
     """Run the attendance checker for a single user"""
     username = user["username"]
     password = user["password"]
@@ -133,12 +135,26 @@ def run_for_user(user):
     print(f"[{username}] Starting...")
     options = Options()
     options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--headless")  # без GUI для сервера
+    options.add_argument("--headless=new")  # без GUI для сервера
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-features=TranslateUI")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    # isolate Chrome instances (important for threads)
+    profile_dir = f"/tmp/chrome-profile-{idx}"
+    options.add_argument(f"--user-data-dir={profile_dir}")
 
+    debug_port = 9222 + idx   # 9222, 9223, ...
+    options.add_argument(f"--remote-debugging-port={debug_port}")
+
+    
     print(f"[{username}] Launching Chrome (headless)...")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    driver = webdriver.Chrome(options=options)
     wait = WebDriverWait(driver, 15)
 
     try:
@@ -198,7 +214,9 @@ def run_for_user(user):
     except KeyboardInterrupt:
         print(f"\n[{username}] Stopped by user")
     except Exception as e:
-        print(f"[{username}] Error: {e}")
+        print(f"[{username}] Error type: {type(e).__name__}")
+        print(f"[{username}] Error repr: {repr(e)}")
+        traceback.print_exc()
     finally:
         driver.quit()
         print(f"[{username}] Browser closed")
@@ -209,8 +227,8 @@ def main():
     print(f"Loaded {len(users)} users from users.json")
 
     threads = []
-    for user in users:
-        t = threading.Thread(target=run_for_user, args=(user,), daemon=True)
+    for idx, user in enumerate(users):
+        t = threading.Thread(target=run_for_user, args=(user, idx), daemon=True)
         t.start()
         threads.append(t)
         time.sleep(2)  # небольшая задержка между запусками
