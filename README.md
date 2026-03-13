@@ -34,24 +34,27 @@ TELEGRAM_BOT_TOKEN=your_token_here
 
 ### 4. Запуск
 
-- **С консолью:** дважды кликни `start.bat`
-- **Без окна (фоном):** дважды кликни `start_hidden.vbs`
+Дважды кликни `start.bat` — откроется консоль с логами.
 
 ## Автозапуск при включении ПК (Task Scheduler)
 
-Чтобы скрипт запускался автоматически при каждом входе в Windows:
+Чтобы скрипт запускался автоматически при загрузке Windows (даже без входа в систему):
 
 1. Открой **Task Scheduler** (Win + R → `taskschd.msc`)
-2. Нажми **Create Basic Task...**
-3. Имя: `KBTU AutoScraper`
-4. Trigger: **When I log on**
-5. Action: **Start a program**
-6. Program: `wscript.exe`
-7. Arguments: `"C:\путь\к\AutoScraper\start_hidden.vbs"`
-8. Поставь галочку **Run with highest privileges**
-9. Готово
+2. Нажми **Create Task...** (не Basic Task)
+3. Вкладка **General**:
+   - Имя: `KBTU AutoScraper`
+   - Выбери **Run whether user is logged on or not**
+   - Поставь галочку **Run with highest privileges**
+4. Вкладка **Triggers** → **New...**:
+   - Begin the task: **At startup**
+5. Вкладка **Actions** → **New...**:
+   - Program: `C:\путь\к\репозиторию\AutoScraper\venv\Scripts\python.exe`
+   - Arguments: `open_kbtu.py`
+   - Start in: `C:\путь\к\репозиторию\AutoScraper`
+6. Нажми **OK**, введи пароль Windows
 
-Теперь скрипт будет запускаться при каждом входе в Windows — без WSL, без Docker.
+Скрипт будет запускаться при каждом включении ПК — без WSL, без Docker, без входа в систему.
 
 ## Логи
 
