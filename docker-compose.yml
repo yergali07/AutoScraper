@@ -1,8 +1,0 @@
-services:
-  autoscraper:
-    build: .
-    container_name: kbtu-attendance
-    restart: unless-stopped
-    env_file:
-      - .env
-    shm_size: 1g

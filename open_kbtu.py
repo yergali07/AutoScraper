@@ -1,244 +1,258 @@
 import os
+import sys
 import json
-import time
-import threading
-import requests
-import traceback
-import re
+import asyncio
+import logging
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from dotenv import load_dotenv
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+import aiohttp
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-REFRESH_INTERVAL = 35  # секунд
+REFRESH_INTERVAL = 35
 LOGIN_URL = "https://wsp.kbtu.kz/RegistrationOnline"
+RETRY_DELAY = 30
+LOGIN_MAX_ATTEMPTS = 3
 
 
-def load_users():
-    """Load users from users.json"""
-    config_path = os.path.join(os.path.dirname(__file__), "users.json")
-    with open(config_path, "r") as f:
+class LoginFailed(Exception):
+    """Raised when all login attempts are exhausted for a user."""
+
+BASE_DIR = Path(__file__).parent
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+
+def setup_logging():
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    file_handler = RotatingFileHandler(
+        LOG_DIR / "autoscraper.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+
+
+def load_users() -> list[dict]:
+    with open(BASE_DIR / "users.json", "r") as f:
         return json.load(f)
 
 
-def send_telegram_message(chat_id, message):
-    """Sends a message via Telegram bot to specific chat_id"""
+async def send_telegram(chat_id: str, message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": chat_id, "text": message}
-        response = requests.post(url, data=data, timeout=10)
-        return response.status_code == 200
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                data={"chat_id": chat_id, "text": message},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                return resp.status == 200
     except Exception as e:
-        print(f"Failed to send Telegram message: {e}")
+        logging.warning("Telegram send failed: %s", e)
         return False
 
 
-def do_login(driver, wait, username, password):
-    """Выполняет логин и возвращает True при успехе"""
-    print(f"[{username}] Attempting login...")
-    driver.get(LOGIN_URL)
-    print(f"[{username}] Page opened successfully!")
+async def do_login(page, username: str, password: str, log: logging.Logger):
+    log.info("Navigating to login page...")
+    await page.goto(LOGIN_URL, wait_until="networkidle", timeout=30_000)
 
-    # Username - это combobox (выпадающий список с возможностью ввода)
-    # Ищем input внутри v-filterselect
-    username_field = wait.until(EC.presence_of_element_located((By.XPATH, "//input[contains(@class, 'v-filterselect-input')]")))
-    username_field.clear()
-    username_field.send_keys(username)
-    time.sleep(0.5)  # дать время на ввод
-    actual_username = username_field.get_attribute('value')
-    print(f"[{username}] Entered username: {username} (actual in field: {actual_username})")
+    log.info("Filling credentials...")
+    username_input = page.locator("input.v-filterselect-input").first
+    await username_input.wait_for(state="visible", timeout=15_000)
+    await username_input.fill(username)
+    await page.wait_for_timeout(500)
 
-    # Password field
-    password_field = driver.find_element(By.XPATH, "//input[@type='password']")
+    password_input = page.locator("input[type='password']").first
+    await password_input.fill(password)
 
-    password_field.clear()
-    password_field.send_keys(password)
-    actual_password = password_field.get_attribute('value')
-    print(f"[{username}] Entered password (actual length: {len(actual_password) if actual_password else 0})")
+    login_btn = page.locator("div.v-button.primary").first
+    await login_btn.click()
+    await page.wait_for_timeout(5000)
 
-    login_button = driver.find_element(By.XPATH, "//div[contains(@class, 'v-button') and contains(@class, 'primary')]")
-    print(f"[{username}] Login button text: {login_button.text}")
-    login_button.click()
-    print(f"[{username}] Clicked login button")
+    buttons = await page.locator("span.v-button-caption").all_text_contents()
+    if any(b in buttons for b in ("Кіру", "Войти", "Login")):
+        log.warning("Login may have failed — login button still visible")
+        return False
 
-    time.sleep(5)  # ждём дольше
-
-    # Сохраняем скриншот
-    driver.save_screenshot(f"/tmp/login_result_{username}.png")
-    print(f"[{username}] Screenshot saved to /tmp/login_result_{username}.png")
-    print(f"[{username}] After login URL: {driver.current_url}")
-
-    # DEBUG: ищем ошибки на странице
-    try:
-        errors = driver.find_elements(By.XPATH, "//*[contains(@class, 'error') or contains(@class, 'v-Notification') or contains(@class, 'warning')]")
-        for err in errors:
-            if err.text.strip():
-                print(f"[{username}]   [ERROR ON PAGE] {err.text}")
-    except:
-        pass
-
-    # DEBUG: выведем весь текст на странице
-    try:
-        body_text = driver.find_element(By.TAG_NAME, "body").text
-        # Возьмем первые 500 символов
-        print(f"[{username}]   [PAGE TEXT] {body_text[:500]}")
-    except:
-        pass
-
-    # DEBUG: проверяем какие кнопки после логина
-    try:
-        all_buttons = driver.find_elements(By.XPATH, "//span[@class='v-button-caption']")
-        btn_texts = [b.text for b in all_buttons if b.text.strip()]
-        print(f"[{username}]   [POST-LOGIN BUTTONS] {btn_texts}")
-        if 'Кіру' in btn_texts or 'Войти' in btn_texts:
-            print(f"[{username}]   !!! LOGIN FAILED - still on login page !!!")
-        else:
-            print(f"[{username}]   LOGIN SUCCESS - inside the app")
-    except Exception as e:
-        print(f"[{username}]   Error checking buttons: {e}")
-
+    log.info("Login successful")
     return True
 
 
-def is_session_expired(driver):
-    """Проверяет, истекла ли сессия (появилась форма логина)"""
+async def login_with_retries(page, username: str, password: str, chat_id: str, log: logging.Logger):
+    """Try to login up to LOGIN_MAX_ATTEMPTS times. Raises LoginFailed if all fail."""
+    for attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
+        try:
+            success = await do_login(page, username, password, log)
+            if success:
+                return
+        except Exception as e:
+            log.warning("Login attempt %d/%d error: %s", attempt, LOGIN_MAX_ATTEMPTS, e)
+            success = False
+
+        if attempt < LOGIN_MAX_ATTEMPTS:
+            log.info("Login failed, retrying (%d/%d)...", attempt, LOGIN_MAX_ATTEMPTS)
+            await asyncio.sleep(5)
+
+    msg = f"[{username}] Login failed after {LOGIN_MAX_ATTEMPTS} attempts. Check your credentials. Stopping."
+    log.error(msg)
+    await send_telegram(chat_id, msg)
+    raise LoginFailed(msg)
+
+
+async def is_session_expired(page) -> bool:
     try:
-        # Проверяем наличие кнопки "Кіру" (казахский) или формы логина
-        buttons = driver.find_elements(By.XPATH, "//span[@class='v-button-caption']")
-        for btn in buttons:
-            if btn.text in ['Кіру', 'Войти', 'Login']:
-                return True
-        # Также проверяем наличие полей логина
-        login_fields = driver.find_elements(By.XPATH, "//input[@type='password']")
-        if login_fields:
+        buttons = await page.locator("span.v-button-caption").all_text_contents()
+        if any(b in buttons for b in ("Кіру", "Войти", "Login")):
             return True
-        return False
-    except:
+        return await page.locator("input[type='password']").count() > 0
+    except Exception:
         return False
 
-def safe_name(s: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", s)
 
-def run_for_user(user, idx: int):
-    """Run the attendance checker for a single user"""
+async def run_for_user(user: dict, browser):
     username = user["username"]
     password = user["password"]
     chat_id = user.get("telegram_chat_id")
+    log = logging.getLogger(username)
 
-    print(f"[{username}] Starting...")
-    options = Options()
-    options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--headless=new")  # без GUI для сервера
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--disable-features=TranslateUI")
-    options.add_argument("--disable-background-networking")
-    options.add_argument("--disable-renderer-backgrounding")
-    options.add_argument("--disable-background-timer-throttling")
-    options.add_argument("--disable-backgrounding-occluded-windows")
-    # isolate Chrome instances (important for threads)
-    profile_dir = f"/tmp/chrome-profile-{idx}"
-    options.add_argument(f"--user-data-dir={profile_dir}")
-
-    debug_port = 9222 + idx   # 9222, 9223, ...
-    options.add_argument(f"--remote-debugging-port={debug_port}")
-
-    
-    print(f"[{username}] Launching Chrome (headless)...")
-    driver = webdriver.Chrome(options=options)
-    wait = WebDriverWait(driver, 15)
+    context = await browser.new_context(
+        viewport={"width": 1920, "height": 1080},
+        ignore_https_errors=True,
+    )
+    page = await context.new_page()
 
     try:
-        do_login(driver, wait, username, password)
+        await login_with_retries(page, username, password, chat_id, log)
 
-        # Цикл обновления
         refresh_count = 0
         while True:
             refresh_count += 1
-            print(f"\n[{username}] [{time.strftime('%H:%M:%S')}] Refresh #{refresh_count}")
+            log.info("Refresh #%d", refresh_count)
 
-            # Вместо refresh() - переходим на URL заново (refresh может сбрасывать сессию)
-            driver.get(LOGIN_URL)
-            time.sleep(3)  # ждём загрузку страницы
-
-            # DEBUG: показываем текущий URL и все кнопки
-            print(f"[{username}]   [URL] {driver.current_url}")
             try:
-                all_buttons = driver.find_elements(By.XPATH, "//span[@class='v-button-caption']")
-                btn_texts = [b.text for b in all_buttons if b.text.strip()]
-                print(f"[{username}]   [ALL BUTTONS] {btn_texts}")
-            except:
-                pass
+                await page.goto(LOGIN_URL, wait_until="networkidle", timeout=30_000)
+            except PlaywrightTimeout:
+                log.warning("Page load timed out, will retry next cycle")
+                await asyncio.sleep(REFRESH_INTERVAL)
+                continue
 
-            # Проверяем, не истекла ли сессия (кнопка Кіру видна = нужен логин)
-            if is_session_expired(driver):
-                print(f"[{username}] >>> Session expired! Re-logging in...")
-                do_login(driver, wait, username, password)
-                time.sleep(5)  # подождать после перелогина
+            await page.wait_for_timeout(2000)
 
-            # Ищем кнопку "Отметиться"
+            if await is_session_expired(page):
+                log.info("Session expired, re-logging in...")
+                await login_with_retries(page, username, password, chat_id, log)
+                await page.wait_for_timeout(3000)
+
             try:
-                otmetitsya_button = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, "//span[@class='v-button-caption' and text()='Отметиться']/ancestor::div[contains(@class, 'v-button')]"))
+                btn_locator = page.locator(
+                    "div.v-button",
+                    has=page.locator("span.v-button-caption", has_text="Отметиться"),
+                ).first
+                await btn_locator.wait_for(state="visible", timeout=5000)
+                await btn_locator.click()
+                log.info("CLICKED 'Отметиться'!")
+                await send_telegram(
+                    chat_id,
+                    f"[{username}] ATTENDANCE MARKED at {datetime.now():%H:%M:%S}",
                 )
-                print(f"[{username}] >>> FOUND 'Отметиться' button! Clicking...")
-                otmetitsya_button.click()
-                print(f"[{username}] >>> CLICKED! <<<")
-                if send_telegram_message(chat_id, f"[{username}] ATTENDANCE MARKED"):
-                    print(f"[{username}] >>> Telegram notification sent!")
-                time.sleep(2)
-            except:
-                print(f"[{username}] Button 'Отметиться' not available")
-                # DEBUG: показываем все кнопки на странице
-                try:
-                    buttons = driver.find_elements(By.XPATH, "//div[contains(@class, 'v-button')]//span[@class='v-button-caption']")
-                    if buttons:
-                        btn_texts = [b.text for b in buttons if b.text.strip()]
-                        if btn_texts:
-                            print(f"[{username}]   [DEBUG] Buttons on page: {btn_texts}")
-                except:
-                    pass
+                await page.wait_for_timeout(2000)
+            except PlaywrightTimeout:
+                visible = [
+                    b
+                    for b in await page.locator("span.v-button-caption").all_text_contents()
+                    if b.strip()
+                ]
+                log.info("'Отметиться' not found. Buttons: %s", visible)
 
-            print(f"[{username}] Waiting {REFRESH_INTERVAL} seconds...")
-            time.sleep(REFRESH_INTERVAL)
+            await asyncio.sleep(REFRESH_INTERVAL)
 
-    except KeyboardInterrupt:
-        print(f"\n[{username}] Stopped by user")
+    except asyncio.CancelledError:
+        log.info("Task cancelled")
     except Exception as e:
-        print(f"[{username}] Error type: {type(e).__name__}")
-        print(f"[{username}] Error repr: {repr(e)}")
-        traceback.print_exc()
+        log.exception("Error: %s", e)
+        await send_telegram(chat_id, f"[{username}] SCRAPER ERROR: {e}")
+        raise
     finally:
-        driver.quit()
-        print(f"[{username}] Browser closed")
+        await context.close()
 
 
-def main():
+async def run_user_forever(user: dict, browser):
+    """Never gives up — restarts with increasing delay on failure, then resets on success."""
+    username = user["username"]
+    chat_id = user.get("telegram_chat_id")
+    log = logging.getLogger(username)
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            await run_for_user(user, browser)
+            attempt = 0
+        except asyncio.CancelledError:
+            break
+        except LoginFailed:
+            log.info("Stopped due to login failure")
+            break
+        except Exception as e:
+            delay = min(RETRY_DELAY * attempt, 300)
+            log.error("Attempt #%d crashed: %s. Restarting in %ds...", attempt, e, delay)
+            await send_telegram(
+                chat_id,
+                f"[{username}] Crashed (attempt #{attempt}): {e}\nRestarting in {delay}s...",
+            )
+            await asyncio.sleep(delay)
+
+
+async def main():
+    setup_logging()
     users = load_users()
-    print(f"Loaded {len(users)} users from users.json")
+    logging.info("Loaded %d user(s) from users.json", len(users))
 
-    threads = []
-    for idx, user in enumerate(users):
-        t = threading.Thread(target=run_for_user, args=(user, idx), daemon=True)
-        t.start()
-        threads.append(t)
-        time.sleep(2)  # небольшая задержка между запусками
+    while True:
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                )
+                logging.info("Browser launched")
 
-    # Ждём все потоки
-    try:
-        for t in threads:
-            t.join()
-    except KeyboardInterrupt:
-        print("\nStopping all users...")
+                tasks = [
+                    asyncio.create_task(run_user_forever(user, browser))
+                    for user in users
+                ]
+
+                try:
+                    await asyncio.gather(*tasks)
+                except KeyboardInterrupt:
+                    logging.info("Stopping...")
+                    for t in tasks:
+                        t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    return
+                finally:
+                    await browser.close()
+
+        except KeyboardInterrupt:
+            logging.info("Stopped by user")
+            return
+        except Exception as e:
+            logging.exception("Browser crashed: %s. Restarting in 30s...", e)
+            await asyncio.sleep(30)
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
