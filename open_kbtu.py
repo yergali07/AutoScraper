@@ -204,8 +204,13 @@ async def run_user_forever(user: dict, browser):
         except asyncio.CancelledError:
             break
         except LoginFailed:
-            log.info("Stopped due to login failure")
-            break
+            delay = min(RETRY_DELAY * attempt, 300)
+            log.error("Login failed (attempt #%d). Retrying in %ds...", attempt, delay)
+            await send_telegram(
+                chat_id,
+                f"[{username}] Login failed (attempt #{attempt}). Retrying in {delay}s...",
+            )
+            await asyncio.sleep(delay)
         except Exception as e:
             delay = min(RETRY_DELAY * attempt, 300)
             log.error("Attempt #%d crashed: %s. Restarting in %ds...", attempt, e, delay)
